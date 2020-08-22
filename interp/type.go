@@ -108,6 +108,7 @@ type itype struct {
 	field       []structField // Array of struct fields if structT or interfaceT
 	key         *itype        // Type of key element if MapT or nil
 	val         *itype        // Type of value element if chanT,chanSendT, chanRecvT, mapT, ptrT, aliasT, arrayT or variadicT
+	recv        *itype        // Receiver type for funcT or nil
 	arg         []*itype      // Argument types if funcT or nil
 	ret         []*itype      // Return types if funcT or nil
 	method      []*node       // Associated methods or nil
@@ -223,8 +224,6 @@ func nodeType(interp *Interpreter, sc *scope, n *node) (*itype, error) {
 			// with the correct type so we must make the const type here.
 			n.rval = reflect.ValueOf(constant.MakeInt64(int64(v)))
 			t = untypedRune
-		case string:
-			t = untypedString
 		case constant.Value:
 			switch v.Kind() {
 			case constant.Bool:
@@ -425,7 +424,6 @@ func nodeType(interp *Interpreter, sc *scope, n *node) (*itype, error) {
 		sym, _, found := sc.lookup(n.ident)
 		if !found {
 			// retry with the filename, in case ident is a package name.
-			// TODO(mpl): try to move that into lookup instead?
 			baseName := filepath.Base(interp.fset.Position(n.pos).Filename)
 			ident := filepath.Join(n.ident, baseName)
 			sym, _, found = sc.lookup(ident)
@@ -562,7 +560,7 @@ func nodeType(interp *Interpreter, sc *scope, n *node) (*itype, error) {
 			if m, _ := lt.lookupMethod(name); m != nil {
 				t, err = nodeType(interp, sc, m.child[2])
 			} else if bm, _, _, ok := lt.lookupBinMethod(name); ok {
-				t = &itype{cat: valueT, rtype: bm.Type, isBinMethod: true, scope: sc}
+				t = &itype{cat: valueT, rtype: bm.Type, recv: lt, isBinMethod: true, scope: sc}
 			} else if ti := lt.lookupField(name); len(ti) > 0 {
 				t = lt.fieldSeq(ti)
 			} else if bs, _, ok := lt.lookupBinField(name); ok {
@@ -580,6 +578,7 @@ func nodeType(interp *Interpreter, sc *scope, n *node) (*itype, error) {
 		if err == nil && t.size != 0 {
 			t1 := *t
 			t1.size = 0
+			t1.sizedef = false
 			t1.rtype = nil
 			t = &t1
 		}
@@ -758,6 +757,41 @@ func (t *itype) referTo(name string, seen map[*itype]bool) bool {
 	return false
 }
 
+func (t *itype) numIn() int {
+	switch t.cat {
+	case funcT:
+		return len(t.arg)
+	case valueT:
+		if t.rtype.Kind() != reflect.Func {
+			return 0
+		}
+		in := t.rtype.NumIn()
+		if t.recv != nil {
+			in--
+		}
+		return in
+	}
+	return 0
+}
+
+func (t *itype) in(i int) *itype {
+	switch t.cat {
+	case funcT:
+		return t.arg[i]
+	case valueT:
+		if t.rtype.Kind() == reflect.Func {
+			if t.recv != nil {
+				i++
+			}
+			if t.rtype.IsVariadic() && i == t.rtype.NumIn()-1 {
+				return &itype{cat: variadicT, val: &itype{cat: valueT, rtype: t.rtype.In(i).Elem()}}
+			}
+			return &itype{cat: valueT, rtype: t.rtype.In(i)}
+		}
+	}
+	return nil
+}
+
 func (t *itype) numOut() int {
 	switch t.cat {
 	case funcT:
@@ -768,6 +802,18 @@ func (t *itype) numOut() int {
 		}
 	}
 	return 1
+}
+
+func (t *itype) out(i int) *itype {
+	switch t.cat {
+	case funcT:
+		return t.ret[i]
+	case valueT:
+		if t.rtype.Kind() == reflect.Func {
+			return &itype{cat: valueT, rtype: t.rtype.Out(i)}
+		}
+	}
+	return nil
 }
 
 func (t *itype) concrete() *itype {
@@ -789,6 +835,21 @@ func (t *itype) isRecursive() bool {
 			if f.typ.referTo(t.path+"/"+t.name, map[*itype]bool{}) {
 				return true
 			}
+		}
+	}
+	return false
+}
+
+// isVariadic returns true if the function type is variadic.
+// If the type is not a function or is not variadic, it will
+// return false.
+func (t *itype) isVariadic() bool {
+	switch t.cat {
+	case funcT:
+		return len(t.arg) > 0 && t.arg[len(t.arg)-1].cat == variadicT
+	case valueT:
+		if t.rtype.Kind() == reflect.Func {
+			return t.rtype.IsVariadic()
 		}
 	}
 	return false
@@ -854,6 +915,24 @@ func (t *itype) assignableTo(o *itype) bool {
 	return t.TypeOf().AssignableTo(o.TypeOf())
 }
 
+// convertibleTo returns true if t is convertible to o.
+func (t *itype) convertibleTo(o *itype) bool {
+	if t.assignableTo(o) {
+		return true
+	}
+
+	// unsafe checkes
+	tt, ot := t.TypeOf(), o.TypeOf()
+	if (tt.Kind() == reflect.Ptr || tt.Kind() == reflect.Uintptr) && ot.Kind() == reflect.UnsafePointer {
+		return true
+	}
+	if tt.Kind() == reflect.UnsafePointer && (ot.Kind() == reflect.Ptr || ot.Kind() == reflect.Uintptr) {
+		return true
+	}
+
+	return t.TypeOf().ConvertibleTo(o.TypeOf())
+}
+
 // ordered returns true if the type is ordered.
 func (t *itype) ordered() bool {
 	typ := t.TypeOf()
@@ -894,41 +973,66 @@ func (m methodSet) equals(n methodSet) bool {
 
 // Methods returns a map of method type strings, indexed by method names.
 func (t *itype) methods() methodSet {
-	res := make(methodSet)
-	switch t.cat {
-	case interfaceT:
-		// Get methods from recursive analysis of interface fields.
-		for _, f := range t.field {
-			if f.typ.cat == funcT {
-				res[f.name] = f.typ.TypeOf().String()
-			} else {
-				for k, v := range f.typ.methods() {
+	seen := map[*itype]bool{}
+	var getMethods func(typ *itype) methodSet
+
+	getMethods = func(typ *itype) methodSet {
+		res := make(methodSet)
+
+		if seen[typ] {
+			// Stop the recursion, we have seen this type.
+			return res
+		}
+		seen[typ] = true
+
+		switch typ.cat {
+		case interfaceT:
+			// Get methods from recursive analysis of interface fields.
+			for _, f := range typ.field {
+				if f.typ.cat == funcT {
+					res[f.name] = f.typ.TypeOf().String()
+				} else {
+					for k, v := range getMethods(f.typ) {
+						res[k] = v
+					}
+				}
+			}
+		case valueT, errorT:
+			// Get method from corresponding reflect.Type.
+			for i := typ.rtype.NumMethod() - 1; i >= 0; i-- {
+				m := typ.rtype.Method(i)
+				res[m.Name] = m.Type.String()
+			}
+		case ptrT:
+			if typ.val.cat == valueT {
+				// Ptr receiver methods need to be found with the ptr type.
+				typ.TypeOf() // Ensure the rtype exists.
+				for i := typ.rtype.NumMethod() - 1; i >= 0; i-- {
+					m := typ.rtype.Method(i)
+					res[m.Name] = m.Type.String()
+				}
+			}
+			for k, v := range getMethods(typ.val) {
+				res[k] = v
+			}
+		case structT:
+			for _, f := range typ.field {
+				if !f.embed {
+					continue
+				}
+				for k, v := range getMethods(f.typ) {
 					res[k] = v
 				}
 			}
 		}
-	case valueT, errorT:
-		// Get method from corresponding reflect.Type.
-		for i := t.rtype.NumMethod() - 1; i >= 0; i-- {
-			m := t.rtype.Method(i)
-			res[m.Name] = m.Type.String()
+		// Get all methods defined on this type.
+		for _, m := range typ.method {
+			res[m.ident] = m.typ.TypeOf().String()
 		}
-	case ptrT:
-		for k, v := range t.val.methods() {
-			res[k] = v
-		}
-	case structT:
-		for _, f := range t.field {
-			for k, v := range f.typ.methods() {
-				res[k] = v
-			}
-		}
+		return res
 	}
-	// Get all methods defined on this type.
-	for _, m := range t.method {
-		res[m.ident] = m.typ.TypeOf().String()
-	}
-	return res
+
+	return getMethods(t)
 }
 
 // id returns a unique type identificator string.
@@ -943,7 +1047,11 @@ func (t *itype) id() (res string) {
 	case nilT:
 		res = "nil"
 	case arrayT:
-		res = "[" + strconv.Itoa(t.size) + "]" + t.val.id()
+		if t.size == 0 {
+			res = "[]" + t.val.id()
+		} else {
+			res = "[" + strconv.Itoa(t.size) + "]" + t.val.id()
+		}
 	case chanT:
 		res = "chan " + t.val.id()
 	case chanSendT:
@@ -952,12 +1060,18 @@ func (t *itype) id() (res string) {
 		res = "<-chan " + t.val.id()
 	case funcT:
 		res = "func("
-		for _, t := range t.arg {
-			res += t.id() + ","
+		for i, t := range t.arg {
+			if i > 0 {
+				res += ","
+			}
+			res += t.id()
 		}
 		res += ")("
-		for _, t := range t.ret {
-			res += t.id() + ","
+		for i, t := range t.ret {
+			if i > 0 {
+				res += ","
+			}
+			res += t.id()
 		}
 		res += ")"
 	case interfaceT:
@@ -1125,7 +1239,7 @@ func (t *itype) lookupMethod(name string) (*node, []int) {
 }
 
 // LookupBinMethod returns a method and a path to access a field in a struct object (the receiver).
-func (t *itype) lookupBinMethod(name string) (m reflect.Method, index []int, isPtr bool, ok bool) {
+func (t *itype) lookupBinMethod(name string) (m reflect.Method, index []int, isPtr, ok bool) {
 	if t.cat == ptrT {
 		return t.val.lookupBinMethod(name)
 	}
@@ -1145,6 +1259,36 @@ func (t *itype) lookupBinMethod(name string) (m reflect.Method, index []int, isP
 		}
 	}
 	return m, index, isPtr, ok
+}
+
+func lookupFieldOrMethod(t *itype, name string) *itype {
+	switch {
+	case t.cat == valueT || t.cat == ptrT && t.val.cat == valueT:
+		m, _, isPtr, ok := t.lookupBinMethod(name)
+		if !ok {
+			return nil
+		}
+		var recv *itype
+		if t.rtype.Kind() != reflect.Interface {
+			recv = t
+			if isPtr && t.cat != ptrT && t.rtype.Kind() != reflect.Ptr {
+				recv = &itype{cat: ptrT, val: t}
+			}
+		}
+		return &itype{cat: valueT, rtype: m.Type, recv: recv}
+	case t.cat == interfaceT:
+		seq := t.lookupField(name)
+		if seq == nil {
+			return nil
+		}
+		return t.fieldSeq(seq)
+	default:
+		n, _ := t.lookupMethod(name)
+		if n == nil {
+			return nil
+		}
+		return n.typ
+	}
 }
 
 func exportName(s string) string {
@@ -1252,8 +1396,14 @@ func (t *itype) refType(defined map[string]*itype, wrapRecursive bool) reflect.T
 			defined[name] = t
 		}
 		var fields []reflect.StructField
+		// TODO(mpl): make Anonymous work for recursive types too. Maybe not worth the
+		// effort, and we're better off just waiting for
+		// https://github.com/golang/go/issues/39717 to land.
 		for _, f := range t.field {
-			field := reflect.StructField{Name: exportName(f.name), Type: f.typ.refType(defined, wrapRecursive), Tag: reflect.StructTag(f.tag)}
+			field := reflect.StructField{
+				Name: exportName(f.name), Type: f.typ.refType(defined, wrapRecursive),
+				Tag: reflect.StructTag(f.tag), Anonymous: (f.embed && !recursive),
+			}
 			fields = append(fields, field)
 		}
 		if recursive && wrapRecursive {
@@ -1371,6 +1521,11 @@ func constToInt(c constant.Value) int {
 	}
 	i, _ := constant.Int64Val(c)
 	return int(i)
+}
+
+func constToString(v reflect.Value) string {
+	c := v.Interface().(constant.Value)
+	return constant.StringVal(c)
 }
 
 func defRecvType(n *node) *itype {

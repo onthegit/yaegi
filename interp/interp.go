@@ -3,17 +3,20 @@ package interp
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"go/build"
 	"go/scanner"
 	"go/token"
 	"io"
+	"io/ioutil"
 	"os"
 	"os/signal"
 	"reflect"
 	"runtime"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -122,7 +125,7 @@ type Interpreter struct {
 	// architectures.
 	id uint64
 
-	Name string // program name
+	name string // name of the input source file (or main)
 
 	opt                        // user settable options
 	cancelChan bool            // enables cancellable chan operations
@@ -134,9 +137,9 @@ type Interpreter struct {
 	mutex    sync.RWMutex
 	frame    *frame            // program data storage during execution
 	universe *scope            // interpreter global level scope
-	scopes   map[string]*scope // package level scopes, indexed by package name
+	scopes   map[string]*scope // package level scopes, indexed by import path
 	srcPkg   imports           // source packages used in interpreter, indexed by path
-	pkgNames map[string]string // package names, indexed by path
+	pkgNames map[string]string // package names, indexed by import path
 	done     chan struct{}     // for cancellation of channel operations
 
 	hooks *hooks // symbol hooks
@@ -145,6 +148,10 @@ type Interpreter struct {
 const (
 	mainID   = "main"
 	selfPath = "github.com/containous/yaegi/interp"
+	// DefaultSourceName is the name used by default when the name of the input
+	// source file has not been specified for an Eval.
+	// TODO(mpl): something even more special as a name?
+	DefaultSourceName = "_.go"
 )
 
 // Symbols exposes interpreter values.
@@ -229,7 +236,7 @@ func New(options Options) *Interpreter {
 	// astDot activates AST graph display for the interpreter
 	i.opt.astDot, _ = strconv.ParseBool(os.Getenv("YAEGI_AST_DOT"))
 
-	// cfgDot activates AST graph display for the interpreter
+	// cfgDot activates CFG graph display for the interpreter
 	i.opt.cfgDot, _ = strconv.ParseBool(os.Getenv("YAEGI_CFG_DOT"))
 
 	// dotCmd defines how to process the dot code generated whenever astDot and/or
@@ -316,15 +323,37 @@ func (interp *Interpreter) resizeFrame() {
 func (interp *Interpreter) main() *node {
 	interp.mutex.RLock()
 	defer interp.mutex.RUnlock()
-	if m, ok := interp.scopes[interp.Name]; ok && m.sym[mainID] != nil {
+	if m, ok := interp.scopes[mainID]; ok && m.sym[mainID] != nil {
 		return m.sym[mainID].node
 	}
 	return nil
 }
 
-// Eval evaluates Go code represented as a string. It returns a map on
-// current interpreted package exported symbols.
+// Eval evaluates Go code represented as a string. Eval returns the last result
+// computed by the interpreter, and a non nil error in case of failure.
 func (interp *Interpreter) Eval(src string) (res reflect.Value, err error) {
+	return interp.eval(src, "", true)
+}
+
+// EvalPath evaluates Go code located at path. EvalPath returns the last result
+// computed by the interpreter, and a non nil error in case of failure.
+func (interp *Interpreter) EvalPath(path string) (res reflect.Value, err error) {
+	// TODO(marc): implement eval of a directory, package and tests.
+	b, err := ioutil.ReadFile(path)
+	if err != nil {
+		return res, err
+	}
+	return interp.eval(string(b), path, false)
+}
+
+func (interp *Interpreter) eval(src, name string, inc bool) (res reflect.Value, err error) {
+	if name != "" {
+		interp.name = name
+	}
+	if interp.name == "" {
+		interp.name = DefaultSourceName
+	}
+
 	defer func() {
 		r := recover()
 		if r != nil {
@@ -335,7 +364,7 @@ func (interp *Interpreter) Eval(src string) (res reflect.Value, err error) {
 	}()
 
 	// Parse source to AST.
-	pkgName, root, err := interp.ast(src, interp.Name)
+	pkgName, root, err := interp.ast(src, interp.name, inc)
 	if err != nil || root == nil {
 		return res, err
 	}
@@ -343,22 +372,29 @@ func (interp *Interpreter) Eval(src string) (res reflect.Value, err error) {
 	if interp.astDot {
 		dotCmd := interp.dotCmd
 		if dotCmd == "" {
-			dotCmd = defaultDotCmd(interp.Name, "yaegi-ast-")
+			dotCmd = defaultDotCmd(interp.name, "yaegi-ast-")
 		}
-		root.astDot(dotWriter(dotCmd), interp.Name)
+		root.astDot(dotWriter(dotCmd), interp.name)
 		if interp.noRun {
 			return res, err
 		}
 	}
 
 	// Perform global types analysis.
-	if err = interp.gtaRetry([]*node{root}, pkgName, interp.Name); err != nil {
+	if err = interp.gtaRetry([]*node{root}, pkgName); err != nil {
 		return res, err
 	}
 
 	// Annotate AST with CFG infos
-	initNodes, err := interp.cfg(root, interp.Name)
+	initNodes, err := interp.cfg(root, pkgName)
 	if err != nil {
+		if interp.cfgDot {
+			dotCmd := interp.dotCmd
+			if dotCmd == "" {
+				dotCmd = defaultDotCmd(interp.name, "yaegi-cfg-")
+			}
+			root.cfgDot(dotWriter(dotCmd))
+		}
 		return res, err
 	}
 
@@ -374,15 +410,17 @@ func (interp *Interpreter) Eval(src string) (res reflect.Value, err error) {
 	interp.mutex.Lock()
 	if interp.universe.sym[pkgName] == nil {
 		// Make the package visible under a path identical to its name
-		interp.srcPkg[pkgName] = interp.scopes[interp.Name].sym
+		// TODO(mpl): srcPkg is supposed to be keyed by importPath. Verify it is necessary, and implement.
+		interp.srcPkg[pkgName] = interp.scopes[pkgName].sym
 		interp.universe.sym[pkgName] = &symbol{kind: pkgSym, typ: &itype{cat: srcPkgT, path: pkgName}}
+		interp.pkgNames[pkgName] = pkgName
 	}
 	interp.mutex.Unlock()
 
 	if interp.cfgDot {
 		dotCmd := interp.dotCmd
 		if dotCmd == "" {
-			dotCmd = defaultDotCmd(interp.Name, "yaegi-cfg-")
+			dotCmd = defaultDotCmd(interp.name, "yaegi-cfg-")
 		}
 		root.cfgDot(dotWriter(dotCmd))
 	}
@@ -406,7 +444,7 @@ func (interp *Interpreter) Eval(src string) (res reflect.Value, err error) {
 	interp.run(root, nil)
 
 	// Wire and execute global vars
-	n, err := genGlobalVars([]*node{root}, interp.scopes[interp.Name])
+	n, err := genGlobalVars([]*node{root}, interp.scopes[pkgName])
 	if err != nil {
 		return res, err
 	}
@@ -492,6 +530,22 @@ func (interp *Interpreter) Use(values Exports) {
 	}
 }
 
+// ignoreScannerError returns true if the error from Go scanner can be safely ignored
+// to let the caller grab one more line before retrying to parse its input.
+func ignoreScannerError(e *scanner.Error, s string) bool {
+	msg := e.Msg
+	if strings.HasSuffix(msg, "found 'EOF'") {
+		return true
+	}
+	if msg == "raw string literal not terminated" {
+		return true
+	}
+	if strings.HasPrefix(msg, "expected operand, found '}'") && !strings.HasSuffix(s, "}") {
+		return true
+	}
+	return false
+}
+
 // REPL performs a Read-Eval-Print-Loop on input reader.
 // Results are printed on output writer.
 func (interp *Interpreter) REPL(in io.Reader, out io.Writer) {
@@ -508,29 +562,38 @@ func (interp *Interpreter) REPL(in io.Reader, out io.Writer) {
 		sc.sym[name] = &symbol{kind: pkgSym, typ: &itype{cat: binPkgT, path: k, scope: sc}}
 	}
 
-	// Set prompt.
-	var v reflect.Value
-	var err error
-	prompt := getPrompt(in, out)
+	ctx, cancel := context.WithCancel(context.Background())
+	end := make(chan struct{})     // channel to terminate signal handling goroutine
+	sig := make(chan os.Signal, 1) // channel to trap interrupt signal (Ctrl-C)
+	prompt := getPrompt(in, out)   // prompt activated on tty like IO stream
+	s := bufio.NewScanner(in)      // read input stream line by line
+	var v reflect.Value            // result value from eval
+	var err error                  // error from eval
+	src := ""                      // source string to evaluate
+	signal.Notify(sig, os.Interrupt)
 	prompt(v)
 
 	// Read, Eval, Print in a Loop.
-	src := ""
-	s := bufio.NewScanner(in)
 	for s.Scan() {
 		src += s.Text() + "\n"
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-		handleSignal(ctx, cancel)
+
+		// The following goroutine handles interrupt signal by canceling eval.
+		go func() {
+			select {
+			case <-sig:
+				cancel()
+			case <-end:
+			}
+		}()
+
 		v, err = interp.EvalWithContext(ctx, src)
-		signal.Reset()
 		if err != nil {
 			switch e := err.(type) {
 			case scanner.ErrorList:
-				// Early failure in the scanner: the source is incomplete
-				// and no AST could be produced, neither compiled / run.
-				// Get one more line, and retry
-				continue
+				if len(e) == 0 || ignoreScannerError(e[0], s.Text()) {
+					continue
+				}
+				fmt.Fprintln(out, e[0])
 			case Panic:
 				fmt.Fprintln(out, e.Value)
 				fmt.Fprintln(out, string(e.Stack))
@@ -538,9 +601,20 @@ func (interp *Interpreter) REPL(in io.Reader, out io.Writer) {
 				fmt.Fprintln(out, err)
 			}
 		}
+
+		if errors.Is(err, context.Canceled) {
+			// Eval has been interrupted by the above signal handling goroutine.
+			ctx, cancel = context.WithCancel(context.Background())
+		} else {
+			// No interrupt, release the above signal handling goroutine.
+			end <- struct{}{}
+		}
+
 		src = ""
 		prompt(v)
 	}
+	cancel() // Do not defer, as cancel func may change over time.
+	// TODO(mpl): log s.Err() if not nil?
 }
 
 // Repl performs a Read-Eval-Print-Loop on input file descriptor.
@@ -566,17 +640,4 @@ func getPrompt(in io.Reader, out io.Writer) func(reflect.Value) {
 		}
 	}
 	return func(reflect.Value) {}
-}
-
-// handleSignal wraps signal handling for eval cancellation.
-func handleSignal(ctx context.Context, cancel context.CancelFunc) {
-	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
-	go func() {
-		select {
-		case <-c:
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
 }

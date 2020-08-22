@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"regexp"
+	"strings"
 	"unicode"
 )
 
@@ -51,8 +52,8 @@ const nilIdent = "nil"
 // and pre-compute frame sizes and indexes for all un-named (temporary) and named
 // variables. A list of nodes of init functions is returned.
 // Following this pass, the CFG is ready to run.
-func (interp *Interpreter) cfg(root *node, pkgID string) ([]*node, error) {
-	sc := interp.initScopePkg(pkgID)
+func (interp *Interpreter) cfg(root *node, importPath string) ([]*node, error) {
+	sc := interp.initScopePkg(importPath)
 	check := typecheck{}
 	var initNodes []*node
 	var err error
@@ -245,6 +246,7 @@ func (interp *Interpreter) cfg(root *node, pkgID string) ([]*node, error) {
 				if n.typ, err = nodeType(interp, sc, n.child[0]); err != nil {
 					return false
 				}
+				// Indicate that the first child is the type
 				n.nleft = 1
 			} else {
 				// Get type from ancestor (implicit type)
@@ -258,18 +260,28 @@ func (interp *Interpreter) cfg(root *node, pkgID string) ([]*node, error) {
 					return false
 				}
 			}
+
+			child := n.child
+			if n.nleft > 0 {
+				n.child[0].typ = n.typ
+				child = n.child[1:]
+			}
 			// Propagate type to children, to handle implicit types
-			for _, c := range n.child {
+			for _, c := range child {
 				switch c.kind {
-				case binaryExpr, unaryExpr:
+				case binaryExpr, unaryExpr, compositeLitExpr:
 					// Do not attempt to propagate composite type to operator expressions,
 					// it breaks constant folding.
-				case callExpr:
+				case keyValueExpr, typeAssertExpr, indexExpr:
+					c.typ = n.typ
+				default:
+					if c.ident == nilIdent {
+						c.typ = sc.getType(nilIdent)
+						continue
+					}
 					if c.typ, err = nodeType(interp, sc, c); err != nil {
 						return false
 					}
-				default:
-					c.typ = n.typ
 				}
 			}
 
@@ -322,6 +334,8 @@ func (interp *Interpreter) cfg(root *node, pkgID string) ([]*node, error) {
 					return false
 				}
 				recvTypeNode.typ = typ
+				n.child[2].typ.recv = typ
+				n.typ.recv = typ
 				index := sc.add(typ)
 				if len(fr.child) > 1 {
 					sc.sym[fr.child[0].ident] = &symbol{index: index, kind: varSym, typ: typ}
@@ -354,19 +368,7 @@ func (interp *Interpreter) cfg(root *node, pkgID string) ([]*node, error) {
 			sc.loop = n
 
 		case importSpec:
-			var name, ipath string
-			if len(n.child) == 2 {
-				ipath = n.child[1].rval.String()
-				name = n.child[0].ident
-			} else {
-				ipath = n.child[0].rval.String()
-				name = identifier.FindString(ipath)
-			}
-			if interp.binPkg[ipath] != nil && name != "." {
-				sc.sym[name] = &symbol{kind: pkgSym, typ: &itype{cat: binPkgT, path: ipath}}
-			} else {
-				sc.sym[name] = &symbol{kind: pkgSym, typ: &itype{cat: srcPkgT, path: ipath}}
-			}
+			// already all done in gta
 			return false
 
 		case typeSpec:
@@ -404,7 +406,7 @@ func (interp *Interpreter) cfg(root *node, pkgID string) ([]*node, error) {
 			// values which may be used in further declarations.
 			if !sc.global {
 				for _, c := range n.child {
-					if _, err = interp.cfg(c, pkgID); err != nil {
+					if _, err = interp.cfg(c, importPath); err != nil {
 						// No error processing here, to allow recovery in subtree nodes.
 						err = nil
 					}
@@ -466,6 +468,7 @@ func (interp *Interpreter) cfg(root *node, pkgID string) ([]*node, error) {
 			wireChild(n)
 			for i := 0; i < n.nleft; i++ {
 				dest, src := n.child[i], n.child[sbase+i]
+				updateSym := false
 				var sym *symbol
 				var level int
 				if n.kind == defineStmt || (n.kind == assignStmt && dest.ident == "_") {
@@ -502,7 +505,7 @@ func (interp *Interpreter) cfg(root *node, pkgID string) ([]*node, error) {
 					dest.val = src.val
 					dest.recv = src.recv
 					dest.findex = sym.index
-					sym.rval = src.rval
+					updateSym = true
 				} else {
 					sym, level, _ = sc.lookup(dest.ident)
 				}
@@ -512,6 +515,15 @@ func (interp *Interpreter) cfg(root *node, pkgID string) ([]*node, error) {
 					break
 				}
 
+				if updateSym {
+					sym.typ = dest.typ
+					sym.rval = src.rval
+					// As we are updating the sym type, we need to update the sc.type
+					// when the sym has an index.
+					if sym.index >= 0 {
+						sc.types[sym.index] = sym.typ.frameType()
+					}
+				}
 				n.findex = dest.findex
 				n.level = dest.level
 
@@ -701,13 +713,22 @@ func (interp *Interpreter) cfg(root *node, pkgID string) ([]*node, error) {
 			}
 			n.findex = sc.add(n.typ)
 			typ := t.TypeOf()
-			switch k := typ.Kind(); k {
-			case reflect.Map:
+			if typ.Kind() == reflect.Map {
+				err = check.assignment(n.child[1], t.key, "map index")
 				n.gen = getIndexMap
-			case reflect.Array, reflect.Slice, reflect.String:
+				break
+			}
+
+			l := -1
+			switch k := typ.Kind(); k {
+			case reflect.Array:
+				l = typ.Len()
+				fallthrough
+			case reflect.Slice, reflect.String:
 				n.gen = getIndexArray
 			case reflect.Ptr:
 				if typ2 := typ.Elem(); typ2.Kind() == reflect.Array {
+					l = typ2.Len()
 					n.gen = getIndexArray
 				} else {
 					err = n.cfgErrorf("type %v does not support indexing", typ)
@@ -715,6 +736,8 @@ func (interp *Interpreter) cfg(root *node, pkgID string) ([]*node, error) {
 			default:
 				err = n.cfgErrorf("type is not an array, slice, string or map: %v", t.id())
 			}
+
+			err = check.index(n.child[1], l)
 
 		case blockStmt:
 			wireChild(n)
@@ -794,57 +817,53 @@ func (interp *Interpreter) cfg(root *node, pkgID string) ([]*node, error) {
 				if op, ok := constBltn[n.child[0].ident]; ok && n.anc.action != aAssign {
 					op(n) // pre-compute non-assigned constant :
 				}
-
 			case n.child[0].isType(sc):
 				// Type conversion expression
-				if isInt(n.child[0].typ.TypeOf()) && n.child[1].kind == basicLit && isFloat(n.child[1].typ.TypeOf()) {
-					err = n.cfgErrorf("truncated to integer")
+				c0, c1 := n.child[0], n.child[1]
+				switch len(n.child) {
+				case 1:
+					err = n.cfgErrorf("missing argument in conversion to %s", c0.typ.id())
+				case 2:
+					err = check.conversion(c1, c0.typ)
+				default:
+					err = n.cfgErrorf("too many arguments in conversion to %s", c0.typ.id())
+				}
+				if err != nil {
 					break
 				}
+
 				n.action = aConvert
 				switch {
-				case isInterface(n.child[0].typ) && !n.child[1].isNil():
+				case isInterface(c0.typ) && !c1.isNil():
 					// Convert to interface: just check that all required methods are defined by concrete type.
-					c0, c1 := n.child[0], n.child[1]
 					if !c1.typ.implements(c0.typ) {
 						err = n.cfgErrorf("type %v does not implement interface %v", c1.typ.id(), c0.typ.id())
 					}
 					// Pass value as is
 					n.gen = nop
-					n.typ = n.child[1].typ
-					n.findex = n.child[1].findex
-					n.level = n.child[1].level
-					n.val = n.child[1].val
-					n.rval = n.child[1].rval
-				case n.child[1].rval.IsValid() && isConstType(n.child[0].typ):
+					n.typ = c1.typ
+					n.findex = c1.findex
+					n.level = c1.level
+					n.val = c1.val
+					n.rval = c1.rval
+				case c1.rval.IsValid() && isConstType(c0.typ):
 					n.gen = nop
 					n.findex = -1
-					n.typ = n.child[0].typ
-					n.rval = n.child[1].rval
-					convertConstantValue(n)
+					n.typ = c0.typ
+					n.rval = c1.rval
 				default:
 					n.gen = convert
-					n.typ = n.child[0].typ
+					n.typ = c0.typ
 					n.findex = sc.add(n.typ)
 				}
 			case isBinCall(n):
-				n.gen = callBin
-				typ := n.child[0].typ.rtype
-				numIn := len(n.child) - 1
-				tni := typ.NumIn()
-				if numIn == 1 && isCall(n.child[1]) {
-					numIn = n.child[1].typ.numOut()
-				}
-				if n.child[0].action == aGetMethod {
-					tni-- // The first argument is the method receiver.
-				}
-				if typ.IsVariadic() {
-					tni-- // The last argument could be empty.
-				}
-				if numIn < tni {
-					err = n.cfgErrorf("not enough arguments in call to %v", n.child[0].name())
+				err = check.arguments(n, n.child[1:], n.child[0], n.action == aCallSlice)
+				if err != nil {
 					break
 				}
+
+				n.gen = callBin
+				typ := n.child[0].typ.rtype
 				if typ.NumOut() > 0 {
 					if funcType := n.child[0].typ.val; funcType != nil {
 						// Use the original unwrapped function type, to allow future field and
@@ -867,6 +886,11 @@ func (interp *Interpreter) cfg(root *node, pkgID string) ([]*node, error) {
 					}
 				}
 			default:
+				err = check.arguments(n, n.child[1:], n.child[0], n.action == aCallSlice)
+				if err != nil {
+					break
+				}
+
 				if n.child[0].action == aGetFunc {
 					// Allocate a frame entry to store the anonymous function definition.
 					sc.add(n.child[0].typ)
@@ -923,9 +947,37 @@ func (interp *Interpreter) cfg(root *node, pkgID string) ([]*node, error) {
 
 		case compositeLitExpr:
 			wireChild(n)
+
+			child := n.child
+			if n.nleft > 0 {
+				child = child[1:]
+			}
+
+			switch n.typ.cat {
+			case arrayT:
+				err = check.arrayLitExpr(child, n.typ.val, n.typ.size)
+			case mapT:
+				err = check.mapLitExpr(child, n.typ.key, n.typ.val)
+			case structT:
+				err = check.structLitExpr(child, n.typ)
+			case valueT:
+				rtype := n.typ.rtype
+				switch rtype.Kind() {
+				case reflect.Struct:
+					err = check.structBinLitExpr(child, rtype)
+				case reflect.Map:
+					ktyp := &itype{cat: valueT, rtype: rtype.Key()}
+					vtyp := &itype{cat: valueT, rtype: rtype.Elem()}
+					err = check.mapLitExpr(child, ktyp, vtyp)
+				}
+			}
+			if err != nil {
+				break
+			}
+
 			n.findex = sc.add(n.typ)
 			// TODO: Check that composite literal expr matches corresponding type
-			n.gen = compositeGenerator(n)
+			n.gen = compositeGenerator(n, n.typ)
 
 		case fallthroughtStmt:
 			if n.anc.kind != caseBody {
@@ -1289,11 +1341,15 @@ func (interp *Interpreter) cfg(root *node, pkgID string) ([]*node, error) {
 				// Search for field must then be performed on type T only (not *T)
 				switch method, ok := n.typ.rtype.MethodByName(n.child[1].ident); {
 				case ok:
+					hasRecvType := n.typ.rtype.Kind() != reflect.Interface
 					n.val = method.Index
 					n.gen = getIndexBinMethod
 					n.action = aGetMethod
 					n.recv = &receiver{node: n.child[0]}
 					n.typ = &itype{cat: valueT, rtype: method.Type, isBinMethod: true}
+					if hasRecvType {
+						n.typ.recv = n.typ
+					}
 				case n.typ.rtype.Kind() == reflect.Ptr:
 					if field, ok := n.typ.rtype.Elem().FieldByName(n.child[1].ident); ok {
 						n.typ = &itype{cat: valueT, rtype: field.Type}
@@ -1313,7 +1369,7 @@ func (interp *Interpreter) cfg(root *node, pkgID string) ([]*node, error) {
 						if m2, ok2 := pt.MethodByName(n.child[1].ident); ok2 {
 							n.val = m2.Index
 							n.gen = getIndexBinPtrMethod
-							n.typ = &itype{cat: valueT, rtype: m2.Type}
+							n.typ = &itype{cat: valueT, rtype: m2.Type, recv: &itype{cat: valueT, rtype: pt}}
 							n.recv = &receiver{node: n.child[0]}
 							n.action = aGetMethod
 						} else {
@@ -1327,14 +1383,14 @@ func (interp *Interpreter) cfg(root *node, pkgID string) ([]*node, error) {
 				// Handle pointer on object defined in runtime
 				if method, ok := n.typ.val.rtype.MethodByName(n.child[1].ident); ok {
 					n.val = method.Index
-					n.typ = &itype{cat: valueT, rtype: method.Type}
+					n.typ = &itype{cat: valueT, rtype: method.Type, recv: n.typ}
 					n.recv = &receiver{node: n.child[0]}
 					n.gen = getIndexBinMethod
 					n.action = aGetMethod
 				} else if method, ok := reflect.PtrTo(n.typ.val.rtype).MethodByName(n.child[1].ident); ok {
 					n.val = method.Index
 					n.gen = getIndexBinMethod
-					n.typ = &itype{cat: valueT, rtype: method.Type}
+					n.typ = &itype{cat: valueT, rtype: method.Type, recv: &itype{cat: valueT, rtype: reflect.PtrTo(n.typ.val.rtype)}}
 					n.recv = &receiver{node: n.child[0]}
 					n.action = aGetMethod
 				} else if field, ok := n.typ.val.rtype.FieldByName(n.child[1].ident); ok {
@@ -1400,7 +1456,7 @@ func (interp *Interpreter) cfg(root *node, pkgID string) ([]*node, error) {
 				}
 				n.recv = &receiver{node: n.child[0], index: lind}
 				n.val = append([]int{m.Index}, lind...)
-				n.typ = &itype{cat: valueT, rtype: m.Type}
+				n.typ = &itype{cat: valueT, rtype: m.Type, recv: n.child[0].typ}
 			} else if ti := n.typ.lookupField(n.child[1].ident); len(ti) > 0 {
 				// Handle struct field
 				n.val = ti
@@ -1503,6 +1559,12 @@ func (interp *Interpreter) cfg(root *node, pkgID string) ([]*node, error) {
 			default:
 				// dereference expression
 				wireChild(n)
+
+				err = check.starExpr(n.child[0])
+				if err != nil {
+					break
+				}
+
 				if c0 := n.child[0]; c0.typ.cat == valueT {
 					n.typ = &itype{cat: valueT, rtype: c0.typ.rtype.Elem()}
 				} else {
@@ -1613,29 +1675,43 @@ func (interp *Interpreter) cfg(root *node, pkgID string) ([]*node, error) {
 			n.child[0].tnext = sbn.start
 
 		case typeAssertExpr:
-			if len(n.child) > 1 {
-				wireChild(n)
-				c1 := n.child[1]
-				if c1.typ == nil {
-					if c1.typ, err = nodeType(interp, sc, c1); err != nil {
-						return
-					}
-				}
-				if n.anc.action != aAssignX {
-					if n.child[0].typ.cat == valueT && isFunc(c1.typ) {
-						// Avoid special wrapping of interfaces and func types.
-						n.typ = &itype{cat: valueT, rtype: c1.typ.TypeOf()}
-					} else {
-						n.typ = c1.typ
-					}
-					n.findex = sc.add(n.typ)
-				}
-			} else {
+			if len(n.child) == 1 {
+				// The "o.(type)" is handled by typeSwitch.
 				n.gen = nop
+				break
+			}
+
+			wireChild(n)
+			c0, c1 := n.child[0], n.child[1]
+			if c1.typ == nil {
+				if c1.typ, err = nodeType(interp, sc, c1); err != nil {
+					return
+				}
+			}
+
+			err = check.typeAssertionExpr(c0, c1.typ)
+			if err != nil {
+				break
+			}
+
+			if n.anc.action != aAssignX {
+				if c0.typ.cat == valueT && isFunc(c1.typ) {
+					// Avoid special wrapping of interfaces and func types.
+					n.typ = &itype{cat: valueT, rtype: c1.typ.TypeOf()}
+				} else {
+					n.typ = c1.typ
+				}
+				n.findex = sc.add(n.typ)
 			}
 
 		case sliceExpr:
 			wireChild(n)
+
+			err = check.sliceExpr(n)
+			if err != nil {
+				break
+			}
+
 			if n.typ, err = nodeType(interp, sc, n); err != nil {
 				return
 			}
@@ -1709,7 +1785,6 @@ func (interp *Interpreter) cfg(root *node, pkgID string) ([]*node, error) {
 							return
 						}
 						// for predeclared identifiers (int, string, etc)
-						// TODO(mpl): find the exact location of the previous declaration in all cases.
 						err = n.cfgErrorf("%s redeclared in this block", c.ident)
 						return
 					}
@@ -1808,7 +1883,12 @@ func childPos(n *node) int {
 }
 
 func (n *node) cfgErrorf(format string, a ...interface{}) *cfgError {
-	a = append([]interface{}{n.interp.fset.Position(n.pos)}, a...)
+	pos := n.interp.fset.Position(n.pos)
+	posString := n.interp.fset.Position(n.pos).String()
+	if pos.Filename == DefaultSourceName {
+		posString = strings.TrimPrefix(posString, DefaultSourceName+":")
+	}
+	a = append([]interface{}{posString}, a...)
 	return &cfgError{n, fmt.Errorf("%s: "+format, a...)}
 }
 
@@ -1963,14 +2043,21 @@ func (n *node) isType(sc *scope) bool {
 		}
 	case selectorExpr:
 		pkg, name := n.child[0].ident, n.child[1].ident
-		if sym, _, ok := sc.lookup(pkg); ok && sym.kind == pkgSym {
-			path := sym.typ.path
-			if p, ok := n.interp.binPkg[path]; ok && isBinType(p[name]) {
-				return true // Imported binary type
-			}
-			if p, ok := n.interp.srcPkg[path]; ok && p[name] != nil && p[name].kind == typeSym {
-				return true // Imported source type
-			}
+		baseName := filepath.Base(n.interp.fset.Position(n.pos).Filename)
+		suffixedPkg := filepath.Join(pkg, baseName)
+		sym, _, ok := sc.lookup(suffixedPkg)
+		if !ok {
+			return false
+		}
+		if sym.kind != pkgSym {
+			return false
+		}
+		path := sym.typ.path
+		if p, ok := n.interp.binPkg[path]; ok && isBinType(p[name]) {
+			return true // Imported binary type
+		}
+		if p, ok := n.interp.srcPkg[path]; ok && p[name] != nil && p[name].kind == typeSym {
+			return true // Imported source type
 		}
 	case identExpr:
 		return sc.getType(n.ident) != nil
@@ -2280,11 +2367,10 @@ func gotoLabel(s *symbol) {
 	}
 }
 
-func compositeGenerator(n *node) (gen bltnGenerator) {
-	switch n.typ.cat {
+func compositeGenerator(n *node, typ *itype) (gen bltnGenerator) {
+	switch typ.cat {
 	case aliasT, ptrT:
-		n.typ = n.typ.val
-		gen = compositeGenerator(n)
+		gen = compositeGenerator(n, n.typ.val)
 	case arrayT:
 		gen = arrayLit
 	case mapT:

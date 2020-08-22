@@ -28,7 +28,36 @@ func (check typecheck) op(p opPredicates, a action, n, c *node, t reflect.Type) 
 	return nil
 }
 
-// addressExpr type checks an assign expression.
+// assignment checks if n can be assigned to typ.
+//
+// Use typ == nil to indicate assignment to an untyped blank identifier.
+func (check typecheck) assignment(n *node, typ *itype, context string) error {
+	if n.typ.untyped {
+		if typ == nil || isInterface(typ) {
+			if typ == nil && n.typ.cat == nilT {
+				return n.cfgErrorf("use of untyped nil in %s", context)
+			}
+			typ = n.typ.defaultType()
+		}
+		if err := check.convertUntyped(n, typ); err != nil {
+			return err
+		}
+	}
+
+	if typ == nil {
+		return nil
+	}
+
+	if !n.typ.assignableTo(typ) {
+		if context == "" {
+			return n.cfgErrorf("cannot use type %s as type %s", n.typ.id(), typ.id())
+		}
+		return n.cfgErrorf("cannot use type %s as type %s in %s", n.typ.id(), typ.id(), context)
+	}
+	return nil
+}
+
+// assignExpr type checks an assign expression.
 //
 // This is done per pair of assignments.
 func (check typecheck) assignExpr(n, dest, src *node) error {
@@ -39,20 +68,7 @@ func (check typecheck) assignExpr(n, dest, src *node) error {
 			dest.typ = dest.typ.defaultType()
 		}
 
-		if src.typ.untyped {
-			typ := dest.typ
-			if typ.isNil() || isInterface(typ) {
-				typ = src.typ.defaultType()
-			}
-			if err := check.convertUntyped(src, typ); err != nil {
-				return err
-			}
-		}
-
-		if !src.typ.assignableTo(dest.typ) {
-			return src.cfgErrorf("cannot use type %s as type %s in assignment", src.typ.id(), dest.typ.id())
-		}
-		return nil
+		return check.assignment(src, dest.typ, "assignment")
 	}
 
 	// assignment operations.
@@ -86,6 +102,14 @@ func (check typecheck) addressExpr(n *node) error {
 			continue
 		}
 		return n.cfgErrorf("invalid operation: cannot take address of %s", c0.typ.id())
+	}
+	return nil
+}
+
+// starExpr type checks a star expression on a variable.
+func (check typecheck) starExpr(n *node) error {
+	if n.typ.TypeOf().Kind() != reflect.Ptr {
+		return n.cfgErrorf("invalid operation: cannot indirect %q", n.name())
 	}
 	return nil
 }
@@ -222,6 +246,487 @@ func (check typecheck) binaryExpr(n *node) error {
 		}
 	}
 	return nil
+}
+
+func (check typecheck) index(n *node, max int) error {
+	if err := check.convertUntyped(n, &itype{cat: intT, name: "int"}); err != nil {
+		return err
+	}
+
+	if !isInt(n.typ.TypeOf()) {
+		return n.cfgErrorf("index %s must be integer", n.typ.id())
+	}
+
+	if !n.rval.IsValid() || max < 1 {
+		return nil
+	}
+
+	if int(vInt(n.rval)) >= max {
+		return n.cfgErrorf("index %s is out of bounds", n.typ.id())
+	}
+
+	return nil
+}
+
+// arrayLitExpr type checks an array composite literal expression.
+func (check typecheck) arrayLitExpr(child []*node, typ *itype, length int) error {
+	visited := make(map[int]bool, len(child))
+	index := 0
+	for _, c := range child {
+		n := c
+		switch {
+		case c.kind == keyValueExpr:
+			if err := check.index(c.child[0], length); err != nil {
+				return c.cfgErrorf("index %s must be integer constant", c.child[0].typ.id())
+			}
+			n = c.child[1]
+			index = int(vInt(c.child[0].rval))
+		case length > 0 && index >= length:
+			return c.cfgErrorf("index %d is out of bounds (>= %d)", index, length)
+		}
+
+		if visited[index] {
+			return n.cfgErrorf("duplicate index %d in array or slice literal", index)
+		}
+		visited[index] = true
+		index++
+
+		if err := check.assignment(n, typ, "array or slice literal"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// mapLitExpr type checks an map composite literal expression.
+func (check typecheck) mapLitExpr(child []*node, ktyp, vtyp *itype) error {
+	visited := make(map[interface{}]bool, len(child))
+	for _, c := range child {
+		if c.kind != keyValueExpr {
+			return c.cfgErrorf("missing key in map literal")
+		}
+
+		key, val := c.child[0], c.child[1]
+		if err := check.assignment(key, ktyp, "map literal"); err != nil {
+			return err
+		}
+
+		if key.rval.IsValid() {
+			kval := key.rval.Interface()
+			if visited[kval] {
+				return c.cfgErrorf("duplicate key %s in map literal", kval)
+			}
+			visited[kval] = true
+		}
+
+		if err := check.assignment(val, vtyp, "map literal"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// structLitExpr type checks a struct composite literal expression.
+func (check typecheck) structLitExpr(child []*node, typ *itype) error {
+	if len(child) == 0 {
+		return nil
+	}
+
+	if child[0].kind == keyValueExpr {
+		// All children must be keyValueExpr
+		visited := make([]bool, len(typ.field))
+		for _, c := range child {
+			if c.kind != keyValueExpr {
+				return c.cfgErrorf("mixture of field:value and value elements in struct literal")
+			}
+
+			key, val := c.child[0], c.child[1]
+			name := key.ident
+			if name == "" {
+				return c.cfgErrorf("invalid field name %s in struct literal", key.typ.id())
+			}
+			i := typ.fieldIndex(name)
+			if i < 0 {
+				return c.cfgErrorf("unknown field %s in struct literal", name)
+			}
+			field := typ.field[i]
+
+			if err := check.assignment(val, field.typ, "struct literal"); err != nil {
+				return err
+			}
+
+			if visited[i] {
+				return c.cfgErrorf("duplicate field name %s in struct literal", name)
+			}
+			visited[i] = true
+		}
+		return nil
+	}
+
+	// No children can be keyValueExpr
+	for i, c := range child {
+		if c.kind == keyValueExpr {
+			return c.cfgErrorf("mixture of field:value and value elements in struct literal")
+		}
+
+		if i >= len(typ.field) {
+			return c.cfgErrorf("too many values in struct literal")
+		}
+		field := typ.field[i]
+		// TODO(nick): check if this field is not exported and in a different package.
+
+		if err := check.assignment(c, field.typ, "struct literal"); err != nil {
+			return err
+		}
+	}
+	if len(child) < len(typ.field) {
+		return child[len(child)-1].cfgErrorf("too few values in struct literal")
+	}
+	return nil
+}
+
+// structBinLitExpr type checks a struct composite literal expression on a binary type.
+func (check typecheck) structBinLitExpr(child []*node, typ reflect.Type) error {
+	if len(child) == 0 {
+		return nil
+	}
+
+	if child[0].kind == keyValueExpr {
+		// All children must be keyValueExpr
+		visited := make(map[string]bool, typ.NumField())
+		for _, c := range child {
+			if c.kind != keyValueExpr {
+				return c.cfgErrorf("mixture of field:value and value elements in struct literal")
+			}
+
+			key, val := c.child[0], c.child[1]
+			name := key.ident
+			if name == "" {
+				return c.cfgErrorf("invalid field name %s in struct literal", key.typ.id())
+			}
+			field, ok := typ.FieldByName(name)
+			if !ok {
+				return c.cfgErrorf("unknown field %s in struct literal", name)
+			}
+
+			if err := check.assignment(val, &itype{cat: valueT, rtype: field.Type}, "struct literal"); err != nil {
+				return err
+			}
+
+			if visited[field.Name] {
+				return c.cfgErrorf("duplicate field name %s in struct literal", name)
+			}
+			visited[field.Name] = true
+		}
+		return nil
+	}
+
+	// No children can be keyValueExpr
+	for i, c := range child {
+		if c.kind == keyValueExpr {
+			return c.cfgErrorf("mixture of field:value and value elements in struct literal")
+		}
+
+		if i >= typ.NumField() {
+			return c.cfgErrorf("too many values in struct literal")
+		}
+		field := typ.Field(i)
+		if !canExport(field.Name) {
+			return c.cfgErrorf("implicit assignment to unexported field %s in %s literal", field.Name, typ)
+		}
+
+		if err := check.assignment(c, &itype{cat: valueT, rtype: field.Type}, "struct literal"); err != nil {
+			return err
+		}
+	}
+	if len(child) < typ.NumField() {
+		return child[len(child)-1].cfgErrorf("too few values in struct literal")
+	}
+	return nil
+}
+
+// sliceExpr type checks a slice expression.
+func (check typecheck) sliceExpr(n *node) error {
+	c, child := n.child[0], n.child[1:]
+
+	t := c.typ.TypeOf()
+	var low, high, max *node
+	if len(child) >= 1 {
+		if n.action == aSlice {
+			low = child[0]
+		} else {
+			high = child[0]
+		}
+	}
+	if len(child) >= 2 {
+		if n.action == aSlice {
+			high = child[1]
+		} else {
+			max = child[1]
+		}
+	}
+	if len(child) == 3 && n.action == aSlice {
+		max = child[2]
+	}
+
+	l := -1
+	valid := false
+	switch t.Kind() {
+	case reflect.String:
+		valid = true
+		if c.rval.IsValid() {
+			l = len(vString(c.rval))
+		}
+		if max != nil {
+			return max.cfgErrorf("invalid operation: 3-index slice of string")
+		}
+	case reflect.Array:
+		valid = true
+		l = t.Len()
+		if c.kind != selectorExpr && (c.sym == nil || c.sym.kind != varSym) {
+			return c.cfgErrorf("cannot slice type %s", c.typ.id())
+		}
+	case reflect.Slice:
+		valid = true
+	case reflect.Ptr:
+		if t.Elem().Kind() == reflect.Array {
+			valid = true
+			l = t.Elem().Len()
+		}
+	}
+	if !valid {
+		return c.cfgErrorf("cannot slice type %s", c.typ.id())
+	}
+
+	var ind [3]int64
+	for i, nod := range []*node{low, high, max} {
+		x := int64(-1)
+		switch {
+		case nod != nil:
+			max := -1
+			if l >= 0 {
+				max = l + 1
+			}
+			if err := check.index(nod, max); err != nil {
+				return err
+			}
+			if nod.rval.IsValid() {
+				x = vInt(nod.rval)
+			}
+		case i == 0:
+			x = 0
+		case l >= 0:
+			x = int64(l)
+		}
+		ind[i] = x
+	}
+
+	for i, x := range ind[:len(ind)-1] {
+		if x <= 0 {
+			continue
+		}
+		for _, y := range ind[i+1:] {
+			if y < 0 || x <= y {
+				continue
+			}
+			return n.cfgErrorf("invalid index values, must be low <= high <= max")
+		}
+	}
+	return nil
+}
+
+// typeAssertionExpr type checks a type assert expression.
+func (check typecheck) typeAssertionExpr(n *node, typ *itype) error {
+	// TODO(nick): This type check is not complete and should be revisited once
+	// https://github.com/golang/go/issues/39717 lands. It is currently impractical to
+	// type check Named types as they cannot be asserted.
+
+	if n.typ.TypeOf().Kind() != reflect.Interface {
+		return n.cfgErrorf("invalid type assertion: non-interface type %s on left", n.typ.id())
+	}
+	ims := n.typ.methods()
+	if len(ims) == 0 {
+		// Empty interface must be a dynamic check.
+		return nil
+	}
+
+	if isInterface(typ) {
+		// Asserting to an interface is a dynamic check as we must look to the
+		// underlying struct.
+		return nil
+	}
+
+	for name := range ims {
+		im := lookupFieldOrMethod(n.typ, name)
+		tm := lookupFieldOrMethod(typ, name)
+		if im == nil {
+			// This should not be possible.
+			continue
+		}
+		if tm == nil {
+			return n.cfgErrorf("impossible type assertion: %s does not implement %s (missing %v method)", typ.id(), n.typ.id(), name)
+		}
+		if tm.recv != nil && tm.recv.TypeOf().Kind() == reflect.Ptr && typ.TypeOf().Kind() != reflect.Ptr {
+			return n.cfgErrorf("impossible type assertion: %s does not implement %s as %q method has a pointer receiver", typ.id(), n.typ.id(), name)
+		}
+
+		err := n.cfgErrorf("impossible type assertion: %s does not implement %s", typ.id(), n.typ.id())
+		if im.numIn() != tm.numIn() || im.numOut() != tm.numOut() {
+			return err
+		}
+		for i := 0; i < im.numIn(); i++ {
+			if !im.in(i).equals(tm.in(i)) {
+				return err
+			}
+		}
+		for i := 0; i < im.numOut(); i++ {
+			if !im.out(i).equals(tm.out(i)) {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// conversion type checks the conversion of n to typ.
+func (check typecheck) conversion(n *node, typ *itype) error {
+	var c constant.Value
+	if n.rval.IsValid() {
+		if con, ok := n.rval.Interface().(constant.Value); ok {
+			c = con
+		}
+	}
+
+	var ok bool
+	switch {
+	case c != nil && isConstType(typ):
+		switch t := typ.TypeOf(); {
+		case representableConst(c, t):
+			ok = true
+		case isInt(n.typ.TypeOf()) && isString(t):
+			codepoint := int64(-1)
+			if i, ok := constant.Int64Val(c); ok {
+				codepoint = i
+			}
+			n.rval = reflect.ValueOf(constant.MakeString(string(rune(codepoint))))
+			ok = true
+		}
+
+	case n.typ.convertibleTo(typ):
+		ok = true
+	}
+	if !ok {
+		return n.cfgErrorf("cannot convert expression of type %s to type %s", n.typ.id(), typ.id())
+	}
+
+	if n.typ.untyped {
+		if isInterface(typ) || c != nil && !isConstType(typ) {
+			typ = n.typ.defaultType()
+		}
+		if err := check.convertUntyped(n, typ); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// arguments type checks the call expression arguments.
+func (check typecheck) arguments(n *node, child []*node, fun *node, ellipsis bool) error {
+	l := len(child)
+	if ellipsis {
+		if !fun.typ.isVariadic() {
+			return n.cfgErrorf("invalid use of ..., corresponding parameter is non-variadic")
+		}
+		if len(child) == 1 && isCall(child[0]) && child[0].child[0].typ.numOut() > 1 {
+			return child[0].cfgErrorf("cannot use ... with %d-valued %s", child[0].child[0].typ.numOut(), child[0].child[0].typ.id())
+		}
+	}
+
+	if len(child) == 1 && isCall(child[0]) && child[0].child[0].typ.numOut() > 1 {
+		// Handle the case of unpacking a n-valued function into the params.
+		c := child[0].child[0]
+		l := c.typ.numOut()
+		if l < fun.typ.numIn() {
+			return child[0].cfgErrorf("not enough arguments in call to %s", fun.name())
+		}
+		for i := 0; i < l; i++ {
+			arg := getArg(fun.typ, i)
+			if arg == nil {
+				return child[0].cfgErrorf("too many arguments")
+			}
+			if !c.typ.out(i).assignableTo(arg) {
+				return child[0].cfgErrorf("cannot use %s as type %s", c.typ.id(), getArgsID(fun.typ))
+			}
+		}
+		return nil
+	}
+
+	var cnt int
+	for i, arg := range child {
+		ellip := i == l-1 && ellipsis
+		if err := check.argument(arg, fun.typ, cnt, ellip); err != nil {
+			return err
+		}
+		cnt++
+	}
+
+	if fun.typ.isVariadic() {
+		cnt++
+	}
+	if cnt < fun.typ.numIn() {
+		return n.cfgErrorf("not enough arguments in call to %s", fun.name())
+	}
+	return nil
+}
+
+func (check typecheck) argument(n *node, ftyp *itype, i int, ellipsis bool) error {
+	typ := getArg(ftyp, i)
+	if typ == nil {
+		return n.cfgErrorf("too many arguments")
+	}
+
+	if isCall(n) && n.child[0].typ.numOut() != 1 {
+		return n.cfgErrorf("cannot use %s as type %s", n.child[0].typ.id(), typ.id())
+	}
+
+	if ellipsis {
+		if i != ftyp.numIn()-1 {
+			return n.cfgErrorf("can only use ... with matching parameter")
+		}
+		t := n.typ.TypeOf()
+		if t.Kind() != reflect.Slice || !(&itype{cat: valueT, rtype: t.Elem()}).assignableTo(typ) {
+			return n.cfgErrorf("cannot use %s as type %s", n.typ.id(), (&itype{cat: arrayT, val: typ}).id())
+		}
+		return nil
+	}
+
+	err := check.assignment(n, typ, "")
+	return err
+}
+
+func getArg(ftyp *itype, i int) *itype {
+	l := ftyp.numIn()
+	switch {
+	case ftyp.isVariadic() && i >= l-1:
+		arg := ftyp.in(l - 1).val
+		return arg
+	case i < l:
+		return ftyp.in(i)
+	default:
+		return nil
+	}
+}
+
+func getArgsID(ftyp *itype) string {
+	res := "("
+	for i, arg := range ftyp.arg {
+		if i > 0 {
+			res += ","
+		}
+		res += arg.id()
+	}
+	res += ")"
+	return res
 }
 
 var errCantConvert = errors.New("cannot convert")
